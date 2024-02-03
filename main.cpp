@@ -1,7 +1,13 @@
 /**
  * @file main.cpp
- * Thanks to the author of NuPacket library Ángel Fernández Pineda
- * Example ported and expanded by Italo Soares.
+ * @author Ángel Fernández Pineda and Italo C J Soares
+ * @date 03/02/2024
+ *
+ * @brief Example of how to use Angel library to communicate over BLE and using freertos tasks to keep a smooth operation even 
+ * in high load situations, incorporates packetization too,
+ * 
+ * @copyright Creative Commons Attribution 4.0 International (CC BY 4.0)
+ *
  */
 
 #include <Arduino.h>
@@ -43,6 +49,111 @@ void start_and_print_info()
 QueueHandle_t rxQueue;
 QueueHandle_t txQueue;
 #define BUFFER_SIZE 517    // Adjust based on your requirements
+
+typedef struct
+{
+	size_t size;
+	uint8_t* data;
+} TxItem;
+
+#include <ctype.h>
+
+#include "esp_log.h"
+
+/* #region Tools for BLE */
+
+void printDataAsAsciiAndHex(const char* tag, const uint8_t* data, size_t size)
+{
+	const size_t bytesPerLine = 16;
+	char lineBuffer[bytesPerLine * 3 + bytesPerLine + 3 + 1];    // Hex + ASCII + spaces and '|' + null terminator
+	size_t dataIndex = 0;
+
+	while (dataIndex < size)
+	{
+		size_t lineBufferIndex = 0;
+		for (size_t i = 0; i < bytesPerLine; ++i)
+		{
+			if (dataIndex + i < size)
+			{
+				snprintf(&lineBuffer[lineBufferIndex], 4, "%02X ", data[dataIndex + i]);    // Hex part
+				lineBufferIndex += 3;                                                       // 2 hex digits and a space
+			}
+			else
+			{
+				// Pad the rest of the hex part if we're at the end
+				snprintf(&lineBuffer[lineBufferIndex], 4, "   ");
+				lineBufferIndex += 3;
+			}
+		}
+
+		lineBuffer[lineBufferIndex++] = '|';    // Separator between hex and ASCII
+
+		for (size_t i = 0; i < bytesPerLine; ++i)
+		{
+			if (dataIndex + i < size)
+			{
+				char c = data[dataIndex + i];
+				lineBuffer[lineBufferIndex++] = isprint((unsigned char)c) ? c : '.';
+			}
+			else
+			{
+				lineBuffer[lineBufferIndex++] = ' ';    // Pad the rest if we're at the end
+			}
+		}
+
+		lineBuffer[lineBufferIndex++] = '|';    // Closing separator
+		lineBuffer[lineBufferIndex] = '\0';     // Ensure null-terminated string
+
+		ESP_LOGI(tag, "%s", lineBuffer);
+		dataIndex += bytesPerLine;
+	}
+}
+
+bool sendDataToTxQueue(const std::string& data)
+{
+	// check if an device is connected, if not, there is no point in sending data
+	if (!NuPacket.isConnected())
+	{
+		ESP_LOGW("TX QUEUE", "No device connected. Cannot send data.");
+		return false;
+	}
+
+	TxItem* item = (TxItem*)malloc(sizeof(TxItem));
+	if (item == nullptr)
+	{
+		ESP_LOGE("TX QUEUE", "Failed to allocate memory for TX item");
+		return false;
+	}
+
+	// Allocate memory for data
+	item->size = data.size();
+	item->data = (uint8_t*)malloc(item->size);
+	if (item->data == nullptr)
+	{
+		ESP_LOGE("TX QUEUE", "Failed to allocate memory for TX data");
+		free(item);    // Clean up previously allocated memory
+		return false;
+	}
+
+	// Copy data into item
+	memcpy(item->data, data.c_str(), item->size);
+
+	// Send to TX task
+	if (xQueueSend(txQueue, &item, portMAX_DELAY) != pdPASS)
+	{
+		ESP_LOGE("TX QUEUE", "Failed to send item to TX task");
+		free(item->data);    // Clean up
+		free(item);          // Clean up
+		return false;
+	}
+
+	return true;
+}
+
+/* #endregion */
+/* #region BLE Tasks for RX and TX */
+#define DEBUG_BLE_RX_INFO
+#define DEBUG_BLE_TX_INFO
 
 void debug_connection_status()
 {
@@ -87,52 +198,7 @@ void debug_connection_status()
 	}
 }
 
-typedef struct
-{
-	size_t size;
-	uint8_t* data;
-} TxItem;
-
-#include "esp_log.h"
-#include <ctype.h>
-
-void printDataAsAsciiAndHex(const char* tag, const uint8_t* data, size_t size) {
-    const size_t bytesPerLine = 16;
-    char lineBuffer[bytesPerLine * 3 + bytesPerLine + 3 + 1]; // Hex + ASCII + spaces and '|' + null terminator
-    size_t dataIndex = 0;
-
-    while (dataIndex < size) {
-        size_t lineBufferIndex = 0;
-        for (size_t i = 0; i < bytesPerLine; ++i) {
-            if (dataIndex + i < size) {
-                snprintf(&lineBuffer[lineBufferIndex], 4, "%02X ", data[dataIndex + i]); // Hex part
-                lineBufferIndex += 3; // 2 hex digits and a space
-            } else {
-                // Pad the rest of the hex part if we're at the end
-                snprintf(&lineBuffer[lineBufferIndex], 4, "   ");
-                lineBufferIndex += 3;
-            }
-        }
-
-        lineBuffer[lineBufferIndex++] = '|'; // Separator between hex and ASCII
-
-        for (size_t i = 0; i < bytesPerLine; ++i) {
-            if (dataIndex + i < size) {
-                char c = data[dataIndex + i];
-                lineBuffer[lineBufferIndex++] = isprint((unsigned char)c) ? c : '.';
-            } else {
-                lineBuffer[lineBufferIndex++] = ' '; // Pad the rest if we're at the end
-            }
-        }
-
-        lineBuffer[lineBufferIndex++] = '|'; // Closing separator
-        lineBuffer[lineBufferIndex] = '\0'; // Ensure null-terminated string
-
-        ESP_LOGI(tag, "%s", lineBuffer);
-        dataIndex += bytesPerLine;
-    }
-}
-
+TaskHandle_t rxTaskHandle;
 void NimBLE_rxTask(void* pvParameters)
 {
 	ESP_LOGI("NimBLE RX", "NimBLE_rxTask starting, current free heap: %d, minimum free heap: %d", esp_get_free_heap_size(),
@@ -149,29 +215,26 @@ void NimBLE_rxTask(void* pvParameters)
 
 	while (1)
 	{
-        ESP_LOGI("NimBLE RX", "Waiting for connection...");
+		ESP_LOGI("NimBLE RX", "Waiting for connection...");
 		if (NuPacket.connect())
 		{
-            ESP_LOGI("NimBLE RX", "Connected!");
+			ESP_LOGI("NimBLE RX", "Connected!");
 			size_t size;
 
 			const uint8_t* data = NuPacket.read(size);
 			while (data)
 			{
-
-                #define DEBUG_BLE_RX_INFO
-
-                #ifdef DEBUG_BLE_RX_INFO 
-                ESP_LOGI("NimBLE RX", "MTU: %d Data packet size %d bytes",NuPacket.getMTU(), size); 
-                printDataAsAsciiAndHex("NimBLE RX", data, size);
-                ESP_LOGI("NimBLE RX", "--end of packet--");
-                #endif
+#ifdef DEBUG_BLE_RX_INFO
+				ESP_LOGI("NimBLE RX", "MTU: %d Data packet size %d bytes", NuPacket.getMTU(), size);
+				printDataAsAsciiAndHex("NimBLE RX", data, size);
+				ESP_LOGI("NimBLE RX", "--end of packet--");
+#endif
 
 				// Prepare data for TX task
 				TxItem* item = (TxItem*)malloc(sizeof(TxItem));
 				if (item == nullptr)
 				{
-                    ESP_LOGE("NimBLE RX", "Failed to allocate memory for TX item");
+					ESP_LOGE("NimBLE RX", "Failed to allocate memory for TX item");
 					continue;    // Skip this packet
 				}
 
@@ -179,7 +242,7 @@ void NimBLE_rxTask(void* pvParameters)
 				item->data = (uint8_t*)malloc(size);
 				if (item->data == nullptr)
 				{
-                    ESP_LOGE("NimBLE RX", "Failed to allocate memory for TX data");
+					ESP_LOGE("NimBLE RX", "Failed to allocate memory for TX data");
 					free(item);    // Clean up previously allocated memory
 					continue;      // Skip this packet
 				}
@@ -188,7 +251,7 @@ void NimBLE_rxTask(void* pvParameters)
 				// Send to TX task
 				if (xQueueSend(txQueue, &item, portMAX_DELAY) != pdPASS)
 				{
-                    ESP_LOGE("NimBLE RX", "Failed to send item to TX task");
+					ESP_LOGE("NimBLE RX", "Failed to send item to TX task");
 					free(item->data);    // Clean up
 					free(item);          // Clean up
 				}
@@ -196,16 +259,17 @@ void NimBLE_rxTask(void* pvParameters)
 				// Receive next packet
 				data = NuPacket.read(size);
 			}
-            ESP_LOGI("NimBLE RX", "Disconnected");
+			ESP_LOGI("NimBLE RX", "Disconnected");
 		}
 	}
 }
 
+TaskHandle_t txTaskHandle;
 void NimBLE_txTask(void* pvParameters)
 {
-    ESP_LOGI("NimBLE TX", "NimBLE_rxTask starting, current free heap: %d, minimum free heap: %d", esp_get_free_heap_size(),
+	ESP_LOGI("NimBLE TX", "NimBLE_rxTask starting, current free heap: %d, minimum free heap: %d", esp_get_free_heap_size(),
 	         esp_get_minimum_free_heap_size());
-             
+
 	while (1)
 	{
 		TxItem* receivedItem = nullptr;
@@ -240,6 +304,15 @@ void NimBLE_txTask(void* pvParameters)
 				{
 					ESP_LOGW("NimBLE TX", "Failed to send package data or no peer connected");
 				}
+				else
+				{
+#ifdef DEBUG_BLE_TX_INFO
+					// ESP_LOGI("NimBLE TX", "Sent package data: %s", packageData);
+					ESP_LOGI("NimBLE RX", "MTU: %d Data packet size %d bytes", NuPacket.getMTU(), currentPackageSize);
+					printDataAsAsciiAndHex("NimBLE TX", (uint8_t*)packageData, currentPackageSize);
+					ESP_LOGI("NimBLE RX", "--end of packet--");
+#endif
+				}
 
 				free(packageData);    // Free the temporary buffer
 
@@ -253,21 +326,23 @@ void NimBLE_txTask(void* pvParameters)
 	}
 }
 
+/* #endregion */
+
 void setup()
 {
 	start_and_print_info();
-
-	// create the queues used
-	// rxQueue = xQueueCreate(10, sizeof(uint8_t));
 	txQueue = xQueueCreate(10, sizeof(TxItem*));
 
-	// create the tasks
-	xTaskCreate(NimBLE_rxTask, "NimBLE_rxTask", 2048, NULL, 5, NULL);
-	xTaskCreate(NimBLE_txTask, "NimBLE_txTask", 2048, NULL, 5, NULL);
+	xTaskCreate(NimBLE_rxTask, "NimBLE_rxTask", 2048, NULL, 5, &rxTaskHandle);
+	xTaskCreate(NimBLE_txTask, "NimBLE_txTask", 2048, NULL, 5, &txTaskHandle);
 }
 
 void loop()
 {
-	Serial.println("loop is alive");
+	ESP_LOGI("Loop", "Loop is alive, current free heap: %d, minimum free heap: %d", esp_get_free_heap_size(),
+	         esp_get_minimum_free_heap_size());
+
+	ESP_LOGI("Loop", "Sending data to TX queue...");
+	sendDataToTxQueue("Hello, World!\n");
 	vTaskDelay(1000 / portTICK_PERIOD_MS);
 }
