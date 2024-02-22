@@ -333,8 +333,8 @@ void setup()
 	start_and_print_info();
 	txQueue = xQueueCreate(10, sizeof(TxItem*));
 
-	xTaskCreate(NimBLE_rxTask, "NimBLE_rxTask", 2048, NULL, 5, &rxTaskHandle);
-	xTaskCreate(NimBLE_txTask, "NimBLE_txTask", 2048, NULL, 5, &txTaskHandle);
+	xTaskCreate(NimBLE_rxTask, "NimBLE_rxTask", 4096, NULL, 5, &rxTaskHandle);
+	xTaskCreate(NimBLE_txTask, "NimBLE_txTask", 8192, NULL, 5, &txTaskHandle);
 }
 
 void loop()
